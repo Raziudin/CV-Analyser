@@ -1,3 +1,4 @@
+import io
 import os
 import re
 import logging
@@ -22,7 +23,7 @@ st.markdown(
     "[data-testid='stSidebarCollapsedControl']{display:none;}</style>",
     unsafe_allow_html=True,
 )
-st.title("📄 CV Analyser")
+st.title("📄 CV Analyser Agent")
 
 
 def get_secret(name):
@@ -53,6 +54,35 @@ APP_PASSWORD = get_secret("APP_PASSWORD")
 MAX_CV_CHARS = 15000
 MAX_TARGET_CHARS = 8000
 
+# Document types: label -> (agent role, writing instructions, file stem)
+DOC_TYPES = {
+    "Cover letter": (
+        "Cover Letter Writer",
+        "Write a tailored cover letter, 250-350 words. Open with the role and a strong hook, "
+        "highlight the 2-3 strongest matches between the CV and the target, address one key gap "
+        "honestly if relevant, and close with a confident call to action.",
+        "cover_letter",
+    ),
+    "Motivational letter": (
+        "Motivation Letter Writer",
+        "Write a motivational letter, 400-500 words, for the program or opportunity. Explain "
+        "genuine motivation, what sparked the interest, relevant academic and project experience "
+        "from the CV, why this specific program or organisation, and what the candidate will "
+        "contribute and gain.",
+        "motivational_letter",
+    ),
+    "Statement of Purpose (SOP)": (
+        "SOP Writer",
+        "Write a Statement of Purpose, 700-900 words, in flowing paragraphs: (1) academic and "
+        "technical background, (2) key research or project experience with concrete details from "
+        "the CV, (3) skills developed and how they connect to the target field, (4) why this "
+        "program or lab and how it fits, (5) short- and long-term goals. Keep a scholarly but "
+        "personal tone.",
+        "statement_of_purpose",
+    ),
+}
+DOC_OPTIONS = ["None"] + list(DOC_TYPES)
+
 
 # ---------- Helpers ----------
 def read_cv(file) -> str:
@@ -72,7 +102,16 @@ def parse_match(text: str):
     return pct, cleaned.strip()
 
 
-def build_crew(cv, target, mode, key, want_letter):
+def to_docx_bytes(text: str) -> bytes:
+    doc = Document()
+    for para in re.split(r"\n\s*\n", text.strip()):
+        doc.add_paragraph(para.strip())
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def build_crew(cv, target, mode, key, doc_type):
     kw = {"model": MODEL, "temperature": 0.2, "api_key": key}
     if PROVIDER in BASE_URLS:
         kw["base_url"] = BASE_URLS[PROVIDER]
@@ -116,22 +155,21 @@ def build_crew(cv, target, mode, key, want_letter):
     agents, tasks = [parser, matcher, coach], [t1, t2, t3]
 
     t4 = None
-    if want_letter:
+    if doc_type in DOC_TYPES:
+        role, instructions, _ = DOC_TYPES[doc_type]
         writer = Agent(
-            role="Cover Letter Writer",
-            goal="Write a tailored, professional cover letter based only on facts in the CV.",
-            backstory="Skilled writer of concise, persuasive application letters. "
-                      "Never fabricates experience, employers, or achievements.",
+            role=role,
+            goal=f"Write a tailored {doc_type.lower()} based only on facts in the CV.",
+            backstory="Skilled writer of persuasive, authentic application documents. "
+                      "Never fabricates experience, employers, grades, publications or achievements.",
             llm=llm, allow_delegation=False)
-        kind = ("a cover letter for this job" if mode == "Job description"
-                else "a statement-of-motivation style cover letter for this program")
         t4 = Task(
-            description=f"Write {kind}, 250-350 words, tailored to the target text, using only facts "
-            "from the CV. Use the candidate's name from the CV. Highlight the 2-3 strongest "
-            "matches with the target and address a key gap honestly if relevant. If the company, "
-            "program, or hiring manager name is not in the target, use a bracketed placeholder "
-            "like [Company Name]. Output plain text, ready to copy.",
-            expected_output="A finished cover letter.",
+            description=f"{instructions}\n\nRules: use only facts from the CV; use the candidate's "
+            "name from the CV; if the organisation, program, lab or recipient name is not in the "
+            "target text, use a bracketed placeholder such as [University Name]; do not mention "
+            "scores or the evaluation. Output plain text, ready to copy, with no markdown "
+            "headings or commentary.",
+            expected_output=f"A finished {doc_type.lower()}.",
             agent=writer, context=[t1, t2])
         agents.append(writer)
         tasks.append(t4)
@@ -149,8 +187,8 @@ with col2:
                         ["Job description", "Master's/PhD program", "General review"])
     target = st.text_area("Paste job / program description",
                           height=180, disabled=(mode == "General review"))
-    want_letter = st.checkbox("Generate cover letter", value=True,
-                              disabled=(mode == "General review"))
+    doc_type = st.selectbox("Document to generate", DOC_OPTIONS,
+                            disabled=(mode == "General review"))
 
 access_code = ""
 if APP_PASSWORD:
@@ -181,7 +219,7 @@ if st.button("Analyse", type="primary"):
 
     if mode == "General review":
         target = "General strong technical CV for entry-level engineering/AI roles."
-        want_letter = False
+        doc_type = "None"
     elif len(target.strip()) < 30:
         st.error("Paste the job / program description first.")
         st.stop()
@@ -190,14 +228,15 @@ if st.button("Analyse", type="primary"):
 
     with st.spinner("Agents working..."):
         try:
-            crew, t2, t3, t4 = build_crew(cv, target, mode, key, want_letter)
+            crew, t2, t3, t4 = build_crew(cv, target, mode, key, doc_type)
             crew.kickoff()
             pct, evaluation = parse_match(t2.output.raw)
             st.session_state["results"] = {
                 "pct": pct,
                 "evaluation": evaluation,
                 "report": t3.output.raw,
-                "letter": t4.output.raw if t4 else None,
+                "doc_text": t4.output.raw if t4 else None,
+                "doc_type": doc_type if t4 else None,
             }
         except Exception as e:
             log.exception("Crew run failed")
@@ -212,8 +251,8 @@ if res:
         st.progress(res["pct"] / 100)
 
     tab_names = ["Evaluation", "Improvement report"]
-    if res["letter"]:
-        tab_names.append("Cover letter")
+    if res["doc_text"]:
+        tab_names.append(res["doc_type"])
     tabs = st.tabs(tab_names)
 
     with tabs[0]:
@@ -222,8 +261,18 @@ if res:
         st.markdown(res["report"])
         full = f"# Evaluation\n\n{res['evaluation']}\n\n---\n\n# Improvements\n\n{res['report']}"
         st.download_button("Download report", full, "cv_report.md", key="dl_report")
-    if res["letter"]:
+    if res["doc_text"]:
         with tabs[2]:
-            st.text_area("Edit before using", res["letter"], height=400, key="letter_box")
-            st.download_button("Download cover letter", res["letter"],
-                               "cover_letter.txt", key="dl_letter")
+            stem = DOC_TYPES[res["doc_type"]][2]
+            st.text_area("Draft (copy from here to edit)", res["doc_text"],
+                         height=450, key="doc_box")
+            words = len(res["doc_text"].split())
+            st.caption(f"{words} words. Review carefully and personalise before sending.")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.download_button("Download .docx", to_docx_bytes(res["doc_text"]),
+                                   f"{stem}.docx", key="dl_docx",
+                                   mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+            with c2:
+                st.download_button("Download .txt", res["doc_text"],
+                                   f"{stem}.txt", key="dl_txt")
