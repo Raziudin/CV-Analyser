@@ -23,7 +23,7 @@ st.markdown(
     "[data-testid='stSidebarCollapsedControl']{display:none;}</style>",
     unsafe_allow_html=True,
 )
-st.title("📄 CV Analyser (CrewAI agents)")
+st.title("📄 CV Analyser Agent")
 
 
 def get_secret(name):
