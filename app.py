@@ -316,3 +316,19 @@ if res:
                                    "rewritten_cv.docx", mime=DOCX_MIME, key="dl_cv_docx")
             with c2:
                 st.download_button("Download CV (.md)", res["new_cv"],
+                                   "rewritten_cv.md", key="dl_cv_md")
+
+    if res["doc_text"]:
+        with tabs[res["doc_type"]]:
+            stem = DOC_TYPES[res["doc_type"]][2]
+            st.text_area("Draft (copy from here to edit)", res["doc_text"],
+                         height=450, key="doc_box")
+            st.caption(f"{len(res['doc_text'].split())} words. "
+                       "Review carefully and personalise before sending.")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.download_button("Download .docx", to_docx_bytes(res["doc_text"]),
+                                   f"{stem}.docx", mime=DOCX_MIME, key="dl_docx")
+            with c2:
+                st.download_button("Download .txt", res["doc_text"],
+                                   f"{stem}.txt", key="dl_txt")
