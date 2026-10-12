@@ -2,3 +2,5 @@ streamlit
 crewai
 pypdf
 python-docx
+python-dotenv
+reportlab
