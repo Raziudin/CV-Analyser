@@ -3,11 +3,18 @@ import os
 import re
 import logging
 from pathlib import Path
+from xml.sax.saxutils import escape
 import streamlit as st
 from dotenv import load_dotenv
 from pypdf import PdfReader
 from docx import Document
 from crewai import Agent, Task, Crew, Process, LLM
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.units import mm
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable
 
 load_dotenv(Path(__file__).parent / "keys" / "keys.env")
 
@@ -23,7 +30,7 @@ st.markdown(
     "[data-testid='stSidebarCollapsedControl']{display:none;}</style>",
     unsafe_allow_html=True,
 )
-st.title("📄 CV Analyser Agent")
+st.title("📄 CV Analyser (CrewAI agents)")
 
 
 def get_secret(name):
@@ -94,7 +101,6 @@ def read_cv(file) -> str:
 
 
 def parse_match(text: str):
-    """Return (percentage or None, text with the MATCH_PERCENTAGE line removed)."""
     m = re.search(r"MATCH_PERCENTAGE:\s*(\d{1,3})", text, re.I)
     pct = min(int(m.group(1)), 100) if m else None
     cleaned = re.sub(r"^.*MATCH_PERCENTAGE:.*\n?", "", text, flags=re.I | re.M)
@@ -102,29 +108,67 @@ def parse_match(text: str):
 
 
 def to_docx_bytes(text: str) -> bytes:
-    """Convert simple text/markdown (#, ##, - bullets) into a .docx file."""
     doc = Document()
-    for raw in text.strip().splitlines():
-        line = raw.strip().replace("**", "")
-        if not line:
-            continue
-        if line.startswith("# "):
-            doc.add_heading(line[2:], level=1)
-        elif line.startswith("## "):
-            doc.add_heading(line[3:], level=2)
-        elif line.startswith(("- ", "* ")):
-            doc.add_paragraph(line[2:], style="List Bullet")
-        else:
-            doc.add_paragraph(line)
+    for para in re.split(r"\n\s*\n", text.strip()):
+        doc.add_paragraph(para.strip())
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
 
 
-DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+def _pdf_text(s: str) -> str:
+    """Make text safe for reportlab's built-in Helvetica (cp1252) and Paragraph markup."""
+    for a, b in {"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"',
+                 "\u2192": "->", "\u2022": "-", "\u00a0": " ", "\u2011": "-"}.items():
+        s = s.replace(a, b)
+    s = s.encode("cp1252", "replace").decode("cp1252")
+    s = escape(s)
+    s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
+    return s
 
 
-def build_crew(cv, target, mode, key, doc_type, rewrite_cv):
+def cv_to_pdf_bytes(text: str) -> bytes:
+    """Render the rewritten CV (light markdown: '# Name', '## Section', '- bullet') to PDF."""
+    name_st = ParagraphStyle("name", fontName="Helvetica-Bold", fontSize=18, leading=22,
+                             alignment=TA_CENTER, spaceAfter=2)
+    contact_st = ParagraphStyle("contact", fontName="Helvetica", fontSize=9, leading=12,
+                                alignment=TA_CENTER, textColor=colors.HexColor("#333333"))
+    head_st = ParagraphStyle("head", fontName="Helvetica-Bold", fontSize=11, leading=14,
+                             spaceBefore=9, spaceAfter=1, textColor=colors.HexColor("#1f3a5f"))
+    body_st = ParagraphStyle("body", fontName="Helvetica", fontSize=9.5, leading=12.5,
+                             spaceAfter=2)
+    bullet_st = ParagraphStyle("bullet", parent=body_st, leftIndent=12, bulletIndent=2,
+                               spaceAfter=1)
+
+    story, in_header = [], True
+    for raw in text.strip().splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("# "):
+            story.append(Paragraph(_pdf_text(line[2:]), name_st))
+        elif line.startswith("## "):
+            in_header = False
+            story.append(Paragraph(_pdf_text(line[3:]).upper(), head_st))
+            story.append(HRFlowable(width="100%", thickness=0.6,
+                                    color=colors.HexColor("#1f3a5f"), spaceAfter=3))
+        elif line[:2] in ("- ", "* ") or line.startswith("\u2022 "):
+            story.append(Paragraph(_pdf_text(line[2:]), bullet_st, bulletText="-"))
+        elif in_header:
+            story.append(Paragraph(_pdf_text(line), contact_st))
+        else:
+            story.append(Paragraph(_pdf_text(line), body_st))
+    if not story:
+        story.append(Spacer(1, 1))
+
+    buf = io.BytesIO()
+    SimpleDocTemplate(buf, pagesize=A4, leftMargin=16 * mm, rightMargin=16 * mm,
+                      topMargin=14 * mm, bottomMargin=14 * mm,
+                      title="CV", author="").build(story)
+    return buf.getvalue()
+
+
+def build_crew(cv, target, mode, key, doc_type, want_cv):
     kw = {"model": MODEL, "temperature": 0.2, "api_key": key}
     if PROVIDER in BASE_URLS:
         kw["base_url"] = BASE_URLS[PROVIDER]
@@ -188,27 +232,32 @@ def build_crew(cv, target, mode, key, doc_type, rewrite_cv):
         tasks.append(t4)
 
     t5 = None
-    if rewrite_cv:
+    if want_cv:
         cv_writer = Agent(
             role="CV Rewriter",
-            goal="Rewrite the CV into a polished, ATS-friendly document tailored to the target.",
-            backstory="Professional CV writer. Uses strong action verbs and quantified impact where "
-                      "the original supports it. Never fabricates employers, dates, degrees, grades, "
-                      "metrics, skills or projects.",
+            goal="Rewrite the CV into a polished, ATS-friendly, tailored version using only real facts.",
+            backstory="Professional CV writer. Strong action verbs, quantified impact where the "
+                      "CV already gives numbers. Never invents employers, dates, degrees, grades, "
+                      "metrics, skills or contact details.",
             llm=llm, allow_delegation=False)
         t5 = Task(
-            description="Rewrite the full CV, tailored to the target and the evaluation. Rules: use "
-            "ONLY facts present in the original CV; keep all real dates, institutions, degrees and "
-            "grades accurate; do not add skills or metrics that are not in the CV (if a bullet would "
-            "benefit from a number you don't have, write a placeholder like [add metric]); reorder "
-            "sections and bullets so the most relevant content for the target comes first; mirror "
-            "relevant keywords from the target only where the CV genuinely supports them; use "
-            "concise bullets starting with strong action verbs. Format: first line '# Full Name', "
-            "second line contact details (copied from the CV), then sections as '## Section Name' "
-            "(e.g. Professional Summary, Education, Projects, Experience, Skills, Certifications), "
-            "bullets as '- text'. Single column, no tables, no commentary before or after.",
-            expected_output="A complete rewritten CV in the specified simple markdown format.",
-            agent=cv_writer, context=[t1, t2, t3])
+            description="Rewrite the candidate's full CV, tailored to the target, in this exact "
+            "light-markdown format:\n"
+            "# Full Name\n"
+            "One or two contact lines (email | phone | city | links) taken from the CV\n"
+            "## Summary\n2-3 line tailored summary\n"
+            "## Education\n(institution, degree, dates, GPA only if present in the CV)\n"
+            "## Experience\n(role, organisation, dates, then '- ' bullets)\n"
+            "## Projects\n(title, then '- ' bullets)\n"
+            "## Skills\n(grouped lines, e.g. 'Programming: Python, C++')\n"
+            "## Certifications\n(only if present in the CV)\n"
+            "Rules: use ONLY facts in the CV (reword for impact, but never invent or inflate "
+            "anything); reorder and emphasise content most relevant to the target; weave in "
+            "target keywords only where the CV truly supports them; omit sections the CV has "
+            "no data for; aim for 1-2 pages; plain text only apart from '#', '##', '- ' and "
+            "**bold** for role titles. No commentary before or after the CV.",
+            expected_output="The rewritten CV in the specified light-markdown format.",
+            agent=cv_writer, context=[t1, t2])
         agents.append(cv_writer)
         tasks.append(t5)
 
@@ -227,7 +276,7 @@ with col2:
                           height=180, disabled=(mode == "General review"))
     doc_type = st.selectbox("Document to generate", DOC_OPTIONS,
                             disabled=(mode == "General review"))
-    rewrite_cv = st.checkbox("Rewrite my CV (tailored to the target)", value=True)
+    want_cv = st.checkbox("Rewrite CV (download as PDF)", value=True)
 
 access_code = ""
 if APP_PASSWORD:
@@ -265,18 +314,20 @@ if st.button("Analyse", type="primary"):
 
     cv, target = cv[:MAX_CV_CHARS], target[:MAX_TARGET_CHARS]
 
-    with st.spinner("Agents working... this can take a few minutes."):
+    with st.spinner("Agents working..."):
         try:
-            crew, t2, t3, t4, t5 = build_crew(cv, target, mode, key, doc_type, rewrite_cv)
+            crew, t2, t3, t4, t5 = build_crew(cv, target, mode, key, doc_type, want_cv)
             crew.kickoff()
             pct, evaluation = parse_match(t2.output.raw)
+            new_cv = t5.output.raw.strip() if t5 else None
             st.session_state["results"] = {
                 "pct": pct,
                 "evaluation": evaluation,
                 "report": t3.output.raw,
                 "doc_text": t4.output.raw if t4 else None,
                 "doc_type": doc_type if t4 else None,
-                "new_cv": t5.output.raw if t5 else None,
+                "new_cv": new_cv,
+                "new_cv_pdf": cv_to_pdf_bytes(new_cv) if new_cv else None,
             }
         except Exception as e:
             log.exception("Crew run failed")
@@ -290,45 +341,38 @@ if res:
         st.metric("Match percentage", f"{res['pct']}%")
         st.progress(res["pct"] / 100)
 
-    names = ["Evaluation", "Improvement report"]
+    tab_names = ["Evaluation", "Improvement report"]
     if res["new_cv"]:
-        names.append("Rewritten CV")
+        tab_names.append("Rewritten CV")
     if res["doc_text"]:
-        names.append(res["doc_type"])
-    tabs = dict(zip(names, st.tabs(names)))
+        tab_names.append(res["doc_type"])
+    tabs = dict(zip(tab_names, st.tabs(tab_names)))
 
     with tabs["Evaluation"]:
         st.markdown(res["evaluation"])
-
     with tabs["Improvement report"]:
         st.markdown(res["report"])
         full = f"# Evaluation\n\n{res['evaluation']}\n\n---\n\n# Improvements\n\n{res['report']}"
         st.download_button("Download report", full, "cv_report.md", key="dl_report")
-
     if res["new_cv"]:
         with tabs["Rewritten CV"]:
-            st.warning("Check every date, grade and claim against your original CV, and "
-                       "replace any [add ...] placeholders before using it.")
-            st.markdown(res["new_cv"])
-            c1, c2 = st.columns(2)
-            with c1:
-                st.download_button("Download CV (.docx)", to_docx_bytes(res["new_cv"]),
-                                   "rewritten_cv.docx", mime=DOCX_MIME, key="dl_cv_docx")
-            with c2:
-                st.download_button("Download CV (.md)", res["new_cv"],
-                                   "rewritten_cv.md", key="dl_cv_md")
-
+            st.download_button("Download CV (PDF)", res["new_cv_pdf"], "rewritten_cv.pdf",
+                               mime="application/pdf", key="dl_cv_pdf")
+            st.caption("Check every line against your original CV before sending.")
+            with st.expander("Preview / copy text", expanded=True):
+                st.markdown(res["new_cv"])
     if res["doc_text"]:
         with tabs[res["doc_type"]]:
             stem = DOC_TYPES[res["doc_type"]][2]
             st.text_area("Draft (copy from here to edit)", res["doc_text"],
                          height=450, key="doc_box")
-            st.caption(f"{len(res['doc_text'].split())} words. "
-                       "Review carefully and personalise before sending.")
+            words = len(res["doc_text"].split())
+            st.caption(f"{words} words. Review carefully and personalise before sending.")
             c1, c2 = st.columns(2)
             with c1:
                 st.download_button("Download .docx", to_docx_bytes(res["doc_text"]),
-                                   f"{stem}.docx", mime=DOCX_MIME, key="dl_docx")
+                                   f"{stem}.docx", key="dl_docx",
+                                   mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
             with c2:
                 st.download_button("Download .txt", res["doc_text"],
                                    f"{stem}.txt", key="dl_txt")
